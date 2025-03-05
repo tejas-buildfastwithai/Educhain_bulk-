@@ -489,6 +489,139 @@ class QnAEngine:
         prompt = f"Generate {num_options} incorrect but plausible options similar to this correct answer: {correct_answer} for this question: {question}. Provide only the options, separated by semicolons. The options should not precede or end with any symbols, it should be similar to the correct answer."
         response = llm.predict(prompt)
         return response.split(';')
+    
+    def _validate_individual_question(self, question_dict: dict, question_model: Type[BaseModel] = None) -> Optional[BaseModel]:
+        """
+        Validate a single question and return None if validation fails.
+        
+        Args:
+            question_dict: Dictionary containing question data
+            question_model: Pydantic model class to validate against
+        """
+        try:
+            if question_model is None:
+                question_model = MCQList
+
+            # Check for basic structure based on model fields
+            required_fields = {field for field, _ in question_model.__fields__.items() 
+                             if not question_model.__fields__[field].default_factory
+                             and question_model.__fields__[field].default is None}
+            
+            if not all(field in question_dict for field in required_fields):
+                missing = required_fields - set(question_dict.keys())
+                print(f"Missing required fields: {missing}")
+                return None
+
+            # Validate through Pydantic model
+            return question_model(**question_dict)
+        except (ValidationError, KeyError, TypeError) as e:
+            print(f"Validation error: {str(e)}")
+            return None
+
+    def _process_topics_data(self, topics_data):
+        """Process topics data into a list of topic-subtopic-objective combinations"""
+        combinations = []
+        total_specified_questions = 0
+        has_question_counts = False
+
+        for topic in topics_data:
+            for subtopic in topic["subtopics"]:
+                for objective in subtopic["learning_objectives"]:
+                    if isinstance(objective, dict) and "objective" in objective and "num_questions" in objective:
+                        has_question_counts = True
+                        combinations.append({
+                            "topic": topic["topic"],
+                            "subtopic": subtopic["name"],
+                            "learning_objective": objective["objective"],
+                            "num_questions": objective["num_questions"]
+                        })
+                        total_specified_questions += objective["num_questions"]
+                    else:
+                        # Handle the case where no question count is specified
+                        objective_text = objective if isinstance(objective, str) else objective["objective"]
+                        combinations.append({
+                            "topic": topic["topic"],
+                            "subtopic": subtopic["name"],
+                            "learning_objective": objective_text,
+                            "num_questions": None
+                        })
+        
+        # Add the missing return statement
+        return combinations, total_specified_questions, has_question_counts
+
+    @retry(stop=stop_after_attempt(3),
+       wait=wait_exponential(multiplier=1, min=4, max=10),
+       retry=lambda e: isinstance(e, (ValidationError, json.JSONDecodeError)))
+    def _generate_questions_with_retry(self, combo, num_questions, 
+                                prompt_template=None, 
+                                question_model=None,
+                                question_list_model=None,
+                                is_per_objective=False,
+                                target_questions=None,
+                                **kwargs):
+        """
+        Generate questions with improved retry mechanism and chunking
+        """
+        MAX_QUESTIONS_PER_BATCH = 3
+        validated_questions = []
+        remaining_questions = num_questions if not target_questions else target_questions
+        total_attempts = 0
+        max_attempts = max(5, (remaining_questions // MAX_QUESTIONS_PER_BATCH) * 2)
+
+        while remaining_questions > 0 and len(validated_questions) < (target_questions or num_questions) and total_attempts < max_attempts:
+            try:
+                # Calculate batch size based on remaining questions
+                current_batch_size = min(MAX_QUESTIONS_PER_BATCH, remaining_questions)
+                
+                # Generate the batch
+                batch_questions = self.generate_questions(
+                    topic=combo["topic"],
+                    num=current_batch_size,
+                    question_type="Multiple Choice",
+                    prompt_template=prompt_template,
+                    response_model=question_list_model,
+                    subtopic=combo["subtopic"],
+                    learning_objective=combo["learning_objective"],
+                    **kwargs
+                )
+
+                # Process the batch
+                if isinstance(batch_questions, question_list_model):
+                    questions_to_validate = batch_questions.questions
+                elif isinstance(batch_questions, dict) and 'questions' in batch_questions:
+                    questions_to_validate = batch_questions.get('questions', [])
+                else:
+                    questions_to_validate = []
+                    print(f"Unexpected response format: {type(batch_questions)}")
+
+                # Validate questions
+                for question in questions_to_validate:
+                    if len(validated_questions) >= (target_questions or num_questions):
+                        break
+
+                    question_dict = question.dict() if hasattr(question, 'dict') else question
+                    
+                    if 'metadata' not in question_dict and hasattr(question_model, '__fields__') and 'metadata' in question_model.__fields__:
+                        question_dict['metadata'] = {
+                            "topic": combo["topic"],
+                            "subtopic": combo["subtopic"],
+                            "learning_objective": combo["learning_objective"]
+                        }
+
+                    validated_question = self._validate_individual_question(question_dict, question_model=question_model)
+                    if validated_question:
+                        validated_questions.append(validated_question)
+                        remaining_questions -= 1
+
+                total_attempts += 1
+
+            except Exception as e:
+                print(f"Error in generation attempt {total_attempts + 1}: {str(e)}")
+                total_attempts += 1
+                if not validated_questions:
+                    continue
+
+        return question_list_model(questions=validated_questions)
 
     def _process_math_result(self, math_result: Any) -> str:
         if isinstance(math_result, dict):
