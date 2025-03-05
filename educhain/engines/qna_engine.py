@@ -896,7 +896,6 @@ class QnAEngine:
         # Initialize variables that might be needed in summary
         base_questions = 0
         remainder = 0
-        print("using bulk")
         if isinstance(topic, (Path, str)) and Path(topic).exists():
             with open(Path(topic), 'r') as f:
                     topics_data = json.load(f)
