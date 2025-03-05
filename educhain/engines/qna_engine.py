@@ -1,7 +1,14 @@
 # educhain/engines/qna_engine.py
 
-from typing import Optional, Type, Any, List, Literal, Union, Tuple
-from pydantic import BaseModel
+from typing import Optional, Type, Any, List, Literal, Union, Tuple, Dict
+from pydantic import BaseModel, Field, ValidationError
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from datetime import datetime
+import concurrent.futures
+import json
+from pathlib import Path
+from tqdm import tqdm
+from tenacity import retry, stop_after_attempt, wait_exponential
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain, RetrievalQA, LLMMathChain
@@ -18,7 +25,7 @@ from educhain.core.config import LLMConfig
 from educhain.models.qna_models import (
     MCQList, ShortAnswerQuestionList, TrueFalseQuestionList,
     FillInBlankQuestionList, MCQListMath, Option ,SolvedDoubt, SpeechInstructions,
-    VisualMCQList, VisualMCQ
+    VisualMCQList, VisualMCQ, BulkMCQ, BulkMCQList
 )
 from educhain.utils.loaders import PdfFileLoader, UrlLoader
 from educhain.utils.output_formatter import OutputFormatter
@@ -34,6 +41,7 @@ from IPython.display import display, HTML
 
 
 import random
+
 
 QuestionType = Literal["Multiple Choice", "Short Answer", "True/False", "Fill in the Blank"]
 OutputFormatType = Literal["pdf", "csv"]
@@ -721,6 +729,222 @@ class QnAEngine:
 
         except Exception as e:
             raise ValueError(f"Error loading image: {str(e)}")
+
+    def bulk_generate_questions(
+    self,
+    topic: Union[str, Path],
+    total_questions: Optional[int] = None,
+    questions_per_objective: Optional[int] = None, 
+    max_workers: Optional[int] = None,
+    output_format: Optional[OutputFormatType] = None,
+    prompt_template: Optional[str] = None,
+    question_model: Type[BaseModel] = BulkMCQ,
+    question_list_model: Type[BaseModel] = BulkMCQList,
+    min_questions_per_batch: int = 3,
+    max_retries: int = 3,
+    **kwargs
+    ):
+        """
+        Enhanced bulk question generation with custom response model support.
+
+        Args:
+            topic: Path to JSON file containing topic structure
+            total_questions: Total number of questions to generate
+            questions_per_objective: Number of questions to generate per learning objective
+            max_workers: Maximum number of concurrent workers
+            output_format: Format for output file (pdf, csv, json)
+            prompt_template: Custom prompt template (optional)
+            question_model: Pydantic model for individual question validation
+            question_list_model: Pydantic model for list of questions
+            min_questions_per_batch: Minimum questions per batch
+            max_retries: Maximum number of retries per batch
+            **kwargs: Additional arguments to pass to question generation
+        """
+        # Initialize variables that might be needed in summary
+        base_questions = 0
+        remainder = 0
+        print("using bulk")
+        if isinstance(topic, (Path, str)) and Path(topic).exists():
+            with open(Path(topic), 'r') as f:
+                    topics_data = json.load(f)
+        else:
+            raise ValueError("Topic must be a path to a JSON file with the required structure.")
+
+        combinations, total_specified, has_question_counts = self._process_topics_data(topics_data)
+        total_objectives = len(combinations)
+
+        # Determine question distribution based on input parameters
+        if questions_per_objective is not None:
+            # Override total_questions if questions_per_objective is specified
+            total_questions = questions_per_objective * total_objectives
+            base_questions = questions_per_objective
+            remainder = 0
+            question_distribution = {
+                f"{combo['topic']}:{combo['subtopic']}:{combo['learning_objective']}": 
+                questions_per_objective for combo in combinations
+            }
+        elif has_question_counts:
+            # Use specified counts from JSON
+            question_distribution = {
+                f"{combo['topic']}:{combo['subtopic']}:{combo['learning_objective']}": 
+                combo['num_questions'] for combo in combinations if combo['num_questions'] is not None
+            }
+            total_questions = total_specified
+            base_questions = total_questions // total_objectives
+            remainder = total_questions % total_objectives
+        else:
+            # Use total_questions parameter and distribute evenly
+            if total_questions is None:
+                total_questions = total_objectives * min_questions_per_batch
+
+            base_questions = max(min_questions_per_batch, total_questions // total_objectives)
+            remainder = total_questions % total_objectives
+
+            question_distribution = {}
+            for i, combo in enumerate(combinations):
+                extra = 1 if i < remainder else 0
+                objective_key = f"{combo['topic']}:{combo['subtopic']}:{combo['learning_objective']}"
+                question_distribution[objective_key] = base_questions + extra
+                
+        all_questions = []
+        failed_batches_count = 0
+        partial_success_count = 0
+
+        # Track failed attempts
+        failed_objectives = {
+            "timestamp": datetime.now().strftime('%Y%m%d_%H%M%S'),
+            "failed_objectives": []
+        }
+
+        def generate_questions_for_objective(combo):
+            """Generate questions for a specific learning objective with failure tracking"""
+            nonlocal failed_batches_count, partial_success_count
+            retries = 0
+            objective_key = f"{combo['topic']}:{combo['subtopic']}:{combo['learning_objective']}"
+            target_questions = question_distribution[objective_key]
+            accumulated_questions = []
+            # print(f"Generating {target_questions} questions for objecjtive: {objective_key}")
+
+            failure_record = {
+                "topic": combo["topic"],
+                "subtopic": combo["subtopic"],
+                "learning_objective": combo["learning_objective"],
+                "target_questions": target_questions,
+                "generated_questions": 0,
+                "retry_attempts": [],
+            }
+
+            while retries < max_retries and len(accumulated_questions) < target_questions:
+                try:
+                    remaining_questions = target_questions - len(accumulated_questions)
+                    batch_result = self._generate_questions_with_retry(
+                        combo,
+                        remaining_questions,
+                        prompt_template=prompt_template,
+                        question_model=question_model,
+                        question_list_model=question_list_model,
+                        is_per_objective=(questions_per_objective is not None),
+                        target_questions=target_questions,  # Add this parameter
+                        **kwargs
+                    )
+
+                    attempt_record = {
+                        "attempt_number": retries + 1,
+                        "timestamp": datetime.now().strftime('%Y%m%d_%H%M%S'),
+                        "questions_requested": remaining_questions,
+                        "questions_generated": 0,
+                        "status": "success",
+                        "error": None
+                    }
+
+                    if batch_result and hasattr(batch_result, 'questions') and batch_result.questions:
+                        new_questions = len(batch_result.questions)
+                        accumulated_questions.extend(batch_result.questions)
+                        attempt_record["questions_generated"] = new_questions
+
+                        if len(accumulated_questions) < target_questions:
+                            partial_success_count += 1
+                            attempt_record["status"] = "partial_success"
+                        retries += 1
+                    else:
+                        attempt_record["status"] = "failed"
+                        retries += 1
+
+                except Exception as e:
+                    attempt_record = {
+                        "attempt_number": retries + 1,
+                        "timestamp": datetime.now().strftime('%Y%m%d_%H%M%S'),
+                        "questions_requested": remaining_questions,
+                        "questions_generated": 0,
+                        "status": "error",
+                        "error": str(e)
+                    }
+                    retries += 1
+
+                failure_record["retry_attempts"].append(attempt_record)
+
+            failure_record["generated_questions"] = len(accumulated_questions)
+            if len(accumulated_questions) < target_questions:
+                failed_objectives["failed_objectives"].append(failure_record)
+                if not accumulated_questions:
+                    failed_batches_count += 1
+                    return None
+
+            return question_list_model(questions=accumulated_questions)
+
+        # Use ThreadPoolExecutor for parallel processing
+        with tqdm(total=len(combinations), desc="Generating questions") as progress_bar:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for combo in combinations:
+                    future = executor.submit(generate_questions_for_objective, combo)
+                    futures.append(future)
+
+                for future in concurrent.futures.as_completed(futures):
+                    batch_result = future.result()
+                    if batch_result and hasattr(batch_result, 'questions') and batch_result.questions:
+                        all_questions.extend(batch_result.questions)
+                    progress_bar.update(1)
+
+        # Handle output formatting for successful questions
+        output_file = None
+        if output_format and all_questions:
+            formatter = OutputFormatter()
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+            if output_format == "pdf":
+                output_file = formatter.to_pdf(question_list_model(questions=all_questions),
+                                            filename=f"questions_{timestamp}.pdf")
+            elif output_format == "csv":
+                output_file = formatter.to_csv(question_list_model(questions=all_questions),
+                                            filename=f"questions_{timestamp}.csv")
+            elif output_format == "json":
+                output_file = f"questions_{timestamp}.json"
+                with open(output_file, 'w') as f:
+                    json.dump([q.dict() for q in all_questions], f, indent=4)
+
+            print(f"Questions saved to: {output_file}")
+
+        # Save failed objectives to JSON if there are any failures
+        if failed_objectives["failed_objectives"]:
+            failed_file = f"failed_questions_{failed_objectives['timestamp']}.json"
+            with open(failed_file, 'w') as f:
+                json.dump(failed_objectives, f, indent=4)
+            print(f"Failed attempts saved to: {failed_file}")
+
+        total_generated = len(all_questions)
+        print(f"\n--- Generation Summary ---")
+        print(f"Total Learning Objectives: {total_objectives}")
+        print(f"Target Total Questions: {total_questions}")
+        print(f"Base Questions per Objective: {base_questions} (plus {remainder} objectives with +1)")
+        print(f"Total Questions Generated: {total_generated}")
+        print(f"Failed Batches: {failed_batches_count}")
+        print(f"Partial Success Batches: {partial_success_count}")
+        print(f"Average Questions per Successful Batch: {total_generated/(total_objectives-failed_batches_count) if total_generated > 0 else 0:.2f}")
+
+        return question_list_model(questions=all_questions), output_file, total_generated, failed_batches_count
+
+
 
     def solve_doubt(
         self,
