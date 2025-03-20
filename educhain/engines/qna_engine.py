@@ -1076,7 +1076,6 @@ class QnAEngine:
 
         return question_list_model(questions=all_questions), output_file, total_generated, failed_batches_count
 
-
     def solve_doubt(
         self,
         image_source: str,
