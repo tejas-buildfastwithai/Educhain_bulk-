@@ -1052,7 +1052,7 @@ class QnAEngine:
                                             filename=f"questions_{timestamp}.csv")
             elif output_format == "json":
                 output_file = f"questions_{timestamp}.json"
-                with open(output_file, 'w') as f:
+                with open(output_file, 'w') as f):
                     json.dump([q.dict() for q in all_questions], f, indent=4)
 
             print(f"Questions saved to: {output_file}")
@@ -1075,7 +1075,6 @@ class QnAEngine:
         print(f"Average Questions per Successful Batch: {total_generated/(total_objectives-failed_batches_count) if total_generated > 0 else 0:.2f}")
 
         return question_list_model(questions=all_questions), output_file, total_generated, failed_batches_count
-
 
 
     def solve_doubt(
